@@ -1,0 +1,60 @@
+*----------------------------------------------------------------------*
+***INCLUDE LZ_BCSF01 .
+*----------------------------------------------------------------------*
+*&---------------------------------------------------------------------*
+*&      Form  convert_message_and_attachmnts
+*&---------------------------------------------------------------------*
+form convert_message_and_attachmnts
+                        using as_message     type zes_email_message
+                              at_documents   type zet_email_documents
+                              at_attachments type zet_email_attachments.
+
+  data:
+    ls_document    type zes_email_documents_line,
+    ls_attachment  type zes_email_attachments_line,
+    lv_message     type string,
+    lv_length      type i,
+    lv_soli        type soli.
+
+  if as_message is not initial .
+
+    ls_document-type = as_message-contenttype.
+    ls_document-subject = as_message-subject.
+    lv_message = as_message-message .
+    lv_length = strlen( lv_message ).
+
+    while lv_length gt '255' .
+      lv_soli-line = lv_message+0(255).
+      append lv_soli to ls_document-content_text.
+      lv_message = lv_message+255.
+      lv_length = strlen( lv_message ).
+    endwhile .
+
+    if not ( lv_message is initial ).
+      lv_soli-line = lv_message .
+      append lv_soli to ls_document-content_text.
+    endif .
+
+    insert ls_document into at_documents index 1.
+    refresh ls_document-content_text .
+
+  endif.
+
+* Convert xstring --> 255 RAW
+  loop at at_attachments into ls_attachment.
+
+    ls_document-type         = ls_attachment-filetype.
+    ls_document-subject      = ls_attachment-filename.
+
+    call function 'SCMS_XSTRING_TO_BINARY'
+      exporting
+        buffer     = ls_attachment-filedata
+      tables
+        binary_tab = ls_document-content_hex.
+
+    append ls_document to at_documents .
+    refresh ls_document-content_hex .
+
+  endloop.
+
+endform.                    " CONVERT_MESSAGE_AND_ATTACHMNTS

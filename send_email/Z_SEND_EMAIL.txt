@@ -1,0 +1,291 @@
+FUNCTION z_send_email.
+*"----------------------------------------------------------------------
+*"*"Local Interface:
+*"  IMPORTING
+*"     VALUE(REQUESTED_STATUS) TYPE  BCS_RQST DEFAULT 'E'
+*"     VALUE(SEND_IMMEDIATELY) TYPE  CHAR1 DEFAULT 'X'
+*"     VALUE(MESSAGE) TYPE  ZES_EMAIL_MESSAGE OPTIONAL
+*"     VALUE(DOCUMENTS) TYPE  ZET_EMAIL_DOCUMENTS OPTIONAL
+*"     VALUE(ATTACHMENTS) TYPE  ZET_EMAIL_ATTACHMENTS OPTIONAL
+*"     VALUE(RECIPIENTS) TYPE  ZET_EMAIL_RECIPIENTS
+*"     VALUE(SENDER) TYPE  XUBNAME DEFAULT SY-UNAME
+*"     VALUE(SENDER_ADDRESS) TYPE  AD_SMTPADR OPTIONAL
+*"     VALUE(COMMIT_WORK) TYPE  FLAG DEFAULT 'X'
+*"  EXPORTING
+*"     VALUE(ERROR_MSG) TYPE  WZRE_MESSAGE
+*"----------------------------------------------------------------------
+* Description:
+* - The minimum requirements are: email address in RECIPIENTS-C_ADDRESS
+*   and a message in MESSAGE (CONTENTTYPE = 'TXT', SUBJECT = 'Test' and
+*   and MESSAGE = 'My Test') and an email is generated!
+* - Document Type/Object Type can be any 3 character PC file extension.
+* - Message content type can be 'TXT' or 'HTM'
+* - If no message is provided then the first document in table DOCUMENTS
+*   is used as the message (Email body) and its subject as the email
+*   subject.
+* - If a message is provided and documents contain data, the
+*   message will be inserted into documents and will become the email
+*   body text.
+* - If documents contain more than 1 document, document 2
+*   and the following become attachments and the subject field will
+*   be converted to the attachment name.
+*----------------------------------------------------------------------*
+* CLASS-DEFINITIONS                                                    *
+*----------------------------------------------------------------------*
+  DATA:
+    send_request         TYPE REF TO cl_bcs,
+    document             TYPE REF TO cl_document_bcs,
+    lc_sender            TYPE REF TO if_sender_bcs,
+    recipient            TYPE REF TO if_recipient_bcs,
+    lx_bcs_exception     TYPE REF TO cx_bcs,
+    lx_document_bcs      TYPE REF TO cx_document_bcs,
+    lx_send_req_bcs      TYPE REF TO cx_send_req_bcs,
+    lx_address_bcs       TYPE REF TO cx_address_bcs,
+    sent_to_all          TYPE os_boolean,
+    lt_attachment_header TYPE soli_tab. "9003489246 - Email attachments from SAP are gibberish
+
+*----------------------------------------------------------------------*
+* INTERNAL TABLES                                                      *
+*----------------------------------------------------------------------*
+  DATA:
+    l_documents TYPE zet_email_documents,
+    iaddsmtp    TYPE bapiadsmtp OCCURS 0 WITH HEADER LINE,
+    ireturn     TYPE bapiret2 OCCURS 0 WITH HEADER LINE.
+
+*----------------------------------------------------------------------*
+* VARIABLES                                                            *
+*----------------------------------------------------------------------*
+  DATA:
+    recipients_line LIKE LINE OF recipients,
+    documents_line  LIKE LINE OF documents,
+    bapiadsmtp      TYPE bapiadsmtp,
+    first           TYPE flag.
+
+*----------------------------------------------------------------------*
+* CONSTANTS                                                            *
+*----------------------------------------------------------------------*
+  CONSTANTS:
+    gmb_domain(16) TYPE c VALUE '@goldmedalbakery',
+    gmb_email(20)  TYPE c VALUE '@goldmedalbakery.com'.
+
+*----------------------------------------------------------------------*
+*----------------------------------------------------------------------*
+
+  CLASS cl_cam_address_bcs DEFINITION LOAD .
+  CLASS cl_abap_char_utilities DEFINITION LOAD .
+
+* Error Message: No email recipient has been provided!'.
+  IF recipients[] IS INITIAL .
+    MOVE 'E'   TO error_msg-msgty.
+    MOVE 'ZSD' TO error_msg-msgid.
+    MOVE '042' TO error_msg-msgno.
+    EXIT .
+  ENDIF.
+
+  l_documents[] = documents[].
+
+  PERFORM convert_message_and_attachmnts
+    USING message l_documents attachments.
+
+  TRY.
+*---- Create persistent send request
+      send_request = cl_bcs=>create_persistent( ).
+
+      CLEAR first .
+      APPEND '&SO_CODEPAGE=4110' TO lt_attachment_header.
+
+      LOOP AT l_documents INTO documents_line .
+        IF first IS INITIAL .
+          MOVE 'X' TO first.
+*-------- Build the Main Document
+          IF documents_line-content_hex[] IS INITIAL.
+            document = cl_document_bcs=>create_document(
+                                i_type    = documents_line-type
+                                i_text    = documents_line-content_text
+                                i_subject = documents_line-subject
+                                i_header  = lt_attachment_header )."9003489246 - Email attachments from SAP are gibberish
+          ELSE .
+            document = cl_document_bcs=>create_document(
+                                i_type    = documents_line-type
+                                i_hex     = documents_line-content_hex
+                                i_subject = documents_line-subject
+                                i_header  = lt_attachment_header )."9003489246 - Email attachments from SAP are gibberish
+          ENDIF .
+        ELSE .
+          IF documents_line-content_hex[] IS INITIAL.
+*---------- Add Attachment
+            CALL METHOD document->add_attachment
+              EXPORTING
+                i_attachment_type    = documents_line-type
+                i_attachment_subject = documents_line-subject
+                i_att_content_text   = documents_line-content_text
+                i_attachment_header  = lt_attachment_header. "9003489246 - Email attachments from SAP are gibberish
+          ELSE .
+            CALL METHOD document->add_attachment
+              EXPORTING
+                i_attachment_type    = documents_line-type
+                i_attachment_subject = documents_line-subject
+                i_att_content_hex    = documents_line-content_hex
+                i_attachment_header  = lt_attachment_header. "9003489246 - Email attachments from SAP are gibberish
+          ENDIF .
+        ENDIF .
+      ENDLOOP .
+
+*---- Add document to send request
+      CALL METHOD send_request->set_document( document ).
+
+* Get sender email address
+      IF sender_address IS INITIAL.
+        CONCATENATE sender gmb_email INTO sender_address.
+      ENDIF.
+
+*---- Get sender object
+      IF sender_address IS INITIAL.
+        lc_sender = cl_sapuser_bcs=>create( sender ).
+      ELSE .
+        lc_sender = cl_cam_address_bcs=>create_internet_address( sender_address ).
+      ENDIF .
+
+*---- Add sender
+      CALL METHOD send_request->set_sender
+        EXPORTING
+          i_sender = lc_sender.
+
+      LOOP AT recipients INTO recipients_line .
+        IF recipients_line-c_address IS INITIAL.
+*-------- Create recipient
+          CLEAR iaddsmtp.
+          REFRESH iaddsmtp.
+          CLEAR bapiadsmtp.
+          CLEAR recipient.
+
+*-------- Read the E-Mail address for the user
+          CALL FUNCTION 'BAPI_USER_GET_DETAIL'
+            EXPORTING
+              username = recipients_line-uname
+            TABLES
+              return   = ireturn
+              addsmtp  = iaddsmtp.
+          LOOP AT iaddsmtp WHERE std_no = 'X'.
+            CLEAR bapiadsmtp .
+            MOVE iaddsmtp TO bapiadsmtp.
+          ENDLOOP .
+
+*-------- If no E-mail address was found, create one.
+          IF bapiadsmtp-e_mail = ''.
+            CONCATENATE recipients_line-uname gmb_domain
+                      INTO recipients_line-c_address.
+          ELSE .
+            MOVE bapiadsmtp-e_mail TO recipients_line-c_address .
+          ENDIF .
+        ENDIF .
+
+        recipient = cl_cam_address_bcs=>create_internet_address( recipients_line-c_address ).
+
+*------ Add recipient with its respective attributes to send request
+        CALL METHOD send_request->add_recipient
+          EXPORTING
+            i_recipient  = recipient
+            i_express    = recipients_line-i_express
+            i_copy       = recipients_line-i_copy
+            i_blind_copy = recipients_line-i_blind_copy
+            i_no_forward = recipients_line-i_no_forward.
+      ENDLOOP .
+
+*---- Set that you don't need a Return Status E-mail
+      DATA : status_mail TYPE bcs_stml.
+      status_mail = requested_status.
+      CALL METHOD send_request->set_status_attributes
+        EXPORTING
+          i_requested_status = requested_status
+          i_status_mail      = status_mail.
+
+*---- Set send immediately flag
+      send_request->set_send_immediately( send_immediately ).
+
+*---- Send document
+      CALL METHOD send_request->send( ).
+
+      IF commit_work IS NOT INITIAL.
+        COMMIT WORK .
+      ENDIF .
+
+*--- Handle document errors
+    CATCH cx_document_bcs INTO lx_document_bcs .
+      IF NOT  lx_document_bcs->msgid IS INITIAL
+      AND NOT lx_document_bcs->msgty IS INITIAL
+      AND NOT lx_document_bcs->msgno IS INITIAL.
+        MOVE lx_document_bcs->msgid TO error_msg-msgid.
+        MOVE lx_document_bcs->msgty TO error_msg-msgty.
+        MOVE lx_document_bcs->msgno TO error_msg-msgno.
+        MOVE lx_document_bcs->msgv1 TO error_msg-msgv1.
+        MOVE lx_document_bcs->msgv2 TO error_msg-msgv2.
+        MOVE lx_document_bcs->msgv3 TO error_msg-msgv3.
+        MOVE lx_document_bcs->msgv4 TO error_msg-msgv4.
+      ELSE.
+*       Error Message: Unknown Error when sending Email!
+        MOVE 'E'   TO error_msg-msgty.
+        MOVE 'ZSD' TO error_msg-msgid.
+        MOVE '044' TO error_msg-msgno.
+      ENDIF.
+
+*--- Handle send request errors
+    CATCH cx_send_req_bcs INTO lx_send_req_bcs .
+      IF NOT  lx_send_req_bcs->msgid IS INITIAL
+      AND NOT lx_send_req_bcs->msgty IS INITIAL
+      AND NOT lx_send_req_bcs->msgno IS INITIAL.
+        MOVE lx_send_req_bcs->msgid TO error_msg-msgid.
+        MOVE lx_send_req_bcs->msgty TO error_msg-msgty.
+        MOVE lx_send_req_bcs->msgno TO error_msg-msgno.
+        MOVE lx_send_req_bcs->msgv1 TO error_msg-msgv1.
+        MOVE lx_send_req_bcs->msgv2 TO error_msg-msgv2.
+        MOVE lx_send_req_bcs->msgv3 TO error_msg-msgv3.
+        MOVE lx_send_req_bcs->msgv4 TO error_msg-msgv4.
+      ELSE.
+*       Error Message: Unknown Error when sending Email!
+        MOVE 'E' TO error_msg-msgty.
+        MOVE 'ZSD' TO error_msg-msgid.
+        MOVE '044' TO error_msg-msgno.
+      ENDIF.
+
+*--- Handle address errors
+    CATCH cx_address_bcs INTO lx_address_bcs .
+      IF NOT  lx_address_bcs->msgid IS INITIAL
+      AND NOT lx_address_bcs->msgty IS INITIAL
+      AND NOT lx_address_bcs->msgno IS INITIAL.
+        MOVE lx_address_bcs->msgid TO error_msg-msgid.
+        MOVE lx_address_bcs->msgty TO error_msg-msgty.
+        MOVE lx_address_bcs->msgno TO error_msg-msgno.
+        MOVE lx_address_bcs->msgv1 TO error_msg-msgv1.
+        MOVE lx_address_bcs->msgv2 TO error_msg-msgv2.
+        MOVE lx_address_bcs->msgv3 TO error_msg-msgv3.
+        MOVE lx_address_bcs->msgv4 TO error_msg-msgv4.
+      ELSE.
+*       Error Message: Unknown Error when sending Email!
+        MOVE 'E' TO error_msg-msgty.
+        MOVE 'ZSD' TO error_msg-msgid.
+        MOVE '044' TO error_msg-msgno.
+      ENDIF.
+
+*--- Handle overall BDC errors
+    CATCH cx_bcs INTO lx_bcs_exception .
+      IF NOT  lx_bcs_exception->msgid IS INITIAL
+      AND NOT lx_bcs_exception->msgty IS INITIAL
+      AND NOT lx_bcs_exception->msgno IS INITIAL.
+        MOVE lx_bcs_exception->msgid TO error_msg-msgid.
+        MOVE lx_bcs_exception->msgty TO error_msg-msgty.
+        MOVE lx_bcs_exception->msgno TO error_msg-msgno.
+        MOVE lx_bcs_exception->msgv1 TO error_msg-msgv1.
+        MOVE lx_bcs_exception->msgv2 TO error_msg-msgv2.
+        MOVE lx_bcs_exception->msgv3 TO error_msg-msgv3.
+        MOVE lx_bcs_exception->msgv4 TO error_msg-msgv4.
+      ELSE .
+*       Error Message: Unknown Error when sending Email!
+        MOVE 'E' TO error_msg-msgty.
+        MOVE 'ZSD' TO error_msg-msgid.
+        MOVE '044' TO error_msg-msgno.
+      ENDIF .
+
+  ENDTRY.
+
+ENDFUNCTION.

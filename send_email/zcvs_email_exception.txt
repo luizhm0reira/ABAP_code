@@ -1,0 +1,443 @@
+REPORT zcvs_email_exception  LINE-SIZE  160
+                                  MESSAGE-ID zsd
+                                  NO STANDARD PAGE HEADING.
+*&---------------------------------------------------------------------*
+* This program is called from ZCVS_REPORT, for:
+* - NO Tracking#
+* - No PGI
+* - No POD
+* - No Invoice
+* - No PO# (Walgreens)
+* - No PO# per store email (Walgreens)
+*&---------------------------------------------------------------------*
+TYPES: BEGIN OF ty_report,
+         lfdat   TYPE char10,    "delivery date
+         tddat   TYPE char10,    "ship date
+         wadat   TYPE char10,    "PGI date
+         podat   TYPE char10,    "POD date
+         bstdk_e TYPE char10,    "ship-to po date (fedex delivered date or 850 po date)
+         kunnr   TYPE kunnr,
+         vbeln   TYPE vbeln,     "delivery
+         vgbel   TYPE vbeln,     "order
+         bolnr   TYPE char35,
+         name1   TYPE char35,
+         adr     TYPE char30,
+       END OF ty_report.
+
+TYPES: BEGIN OF ty_report_dtl,
+         kunnr    TYPE kunnr,
+         bstdk_e  TYPE char10,    "ship-to po date (fedex delivered date or 850 po date)
+         bolnr    TYPE char35,
+         vbeln    TYPE vbeln,     "delivery
+         matnr    TYPE matnr,
+         lfimg    TYPE num5,
+         case_qty TYPE num5,
+         kdmat    TYPE kdmat,
+         maktx    TYPE maktx,
+         name1    TYPE char35,
+       END OF ty_report_dtl.
+
+DATA: gt_report     TYPE STANDARD TABLE OF ty_report,
+      gt_list       TYPE STANDARD TABLE OF ty_report,
+      gt_report_dtl TYPE STANDARD TABLE OF ty_report_dtl,
+      gt_list_dtl   TYPE STANDARD TABLE OF ty_report_dtl,
+      w_heading(15),
+      w_name(30),
+      w_kunnr       TYPE kna1-kunnr.
+
+DATA: gs_report     TYPE ty_report,
+      gs_report_dtl TYPE ty_report_dtl.
+
+DATA: gv_email      TYPE ad_smtpadr.
+
+SELECT-OPTIONS: s_email FOR gv_email LOWER CASE.
+
+PARAMETERS: p_rpt  TYPE char3,
+            p_subj TYPE char50 DEFAULT 'B2B Exception'.
+
+IMPORT gt_list     FROM MEMORY ID 'B2BEXP'.
+IMPORT gt_list_dtl FROM MEMORY ID 'B2BEXP'.
+
+IF p_rpt = 'STR'.    "NO PO per store
+  PERFORM write_report_dtl.
+ELSE.
+  PERFORM write_report.
+ENDIF.
+
+*---------------------------------------------------------------------*
+* END-OF-SELECTION                                                    *
+*---------------------------------------------------------------------*
+END-OF-SELECTION.
+
+*---------------------------------------------------------------------*
+*    TOP OF PAGE                                                      *
+*---------------------------------------------------------------------*
+TOP-OF-PAGE.
+
+  PERFORM pagehead.
+
+*---------------------------------------------------------------------*
+*       FORM PAGEHEAD                                                 *
+*---------------------------------------------------------------------*
+FORM pagehead.
+
+  DATA:
+    lv_col    TYPE i VALUE 3.
+
+  IF  p_rpt = 'PGI'.
+    w_heading = 'No PGI'.
+  ELSEIF p_rpt = 'POD'.
+    w_heading = 'No POD'.
+  ELSEIF p_rpt = 'INV'.
+    w_heading = 'No Invoice'.
+  ELSEIF p_rpt = 'TRK'.
+    w_heading = 'No Tracking#'.
+  ELSEIF p_rpt = 'PO'.
+    w_heading = 'No PO'.
+  ELSEIF p_rpt = 'STR'.
+    w_heading = 'No PO'.
+  ENDIF.
+
+  WRITE: /001(010) sy-datum MM/DD/YYYY,
+          012(008) sy-uzeit USING EDIT MASK '__:__:__',
+          068(015) w_heading,
+          148(003) sy-pagno NO-ZERO RIGHT-JUSTIFIED NO-SIGN.
+
+  ULINE.
+
+  IF p_rpt = 'PO'.
+    WRITE: /006(008) 'Customer' RIGHT-JUSTIFIED,
+            042(010) 'Tracking#',
+            070(011) 'Delivery Dt',
+            083(010) 'Ship Dt',
+            094(010) 'FedEx Dt',
+            106(010) 'Delivery',
+            120(010) 'Order',
+            130(010) 'City/State'.
+
+  ELSEIF p_rpt = 'STR'.
+    WRITE: /001 w_name.
+    SKIP 1.
+    WRITE: /001(008) 'Invoice#',
+            013(008) 'FedEx Dt',
+            028(010) 'Tracking#',
+            083(010) 'Qty',
+            096(010) 'Case'.
+  ELSE.
+    WRITE: /006(008) 'Customer' RIGHT-JUSTIFIED,
+            045(010) 'Tracking#',
+            071(010) 'Deliv Dt',
+            084(010) 'Ship Dt',
+            096(010) 'PGI Dt',
+            108(010) 'POD Dt',
+            119(008) 'Document',
+            130(010) 'City/State'.
+  ENDIF.
+
+  NEW-LINE.
+  ULINE.
+
+ENDFORM.               "pagehead
+*&---------------------------------------------------------------------*
+*&      Form  WRITE_REPORT
+*&---------------------------------------------------------------------*
+FORM write_report.
+
+  FIELD-SYMBOLS: <x> TYPE x.
+
+  DATA:
+    lt_html TYPE w3htmltab,
+    lt_att  TYPE zet_email_attachments,
+    lt_rec  TYPE zet_email_recipients.
+
+  DATA:
+    ls_error_msg TYPE wzre_message,
+    ls_msg       TYPE zes_email_message,
+    ls_html      TYPE w3html,
+    ls_att       TYPE zes_email_attachments_line,
+    ls_rec       TYPE zes_email_recipients_line.
+
+  DATA:
+    lv_date_curr TYPE char10,
+    lv_time_curr TYPE char8,
+    lv_col       TYPE i,
+    lv_bin_file  TYPE xstring,
+    lv_att_line  TYPE string,
+    w_lfdat      TYPE sy-datum,
+    w_tddat      TYPE sy-datum,
+    w_podat      TYPE sy-datum,
+    w_bstdk_e    TYPE sy-datum,
+    w_wadat      TYPE sy-datum,
+    w_kunnr      TYPE kna1-kunnr.
+
+  IF  p_rpt = 'PGI'.
+    SORT gt_list BY tddat kunnr.
+  ELSEIF p_rpt = 'POD'.
+    SORT gt_list BY wadat kunnr.
+  ELSEIF p_rpt = 'INV'.
+    SORT gt_list BY podat kunnr.
+  ELSEIF p_rpt = 'TRK'.
+    SORT gt_list BY tddat kunnr.
+  ELSEIF p_rpt = 'PO'.
+    SORT gt_list BY tddat kunnr.
+  ENDIF.
+
+  LOOP AT gt_list INTO gs_report.
+
+    MOVE: gs_report-lfdat   TO w_lfdat,
+          gs_report-tddat   TO w_tddat,
+          gs_report-wadat   TO w_wadat,
+          gs_report-podat   TO w_podat,
+          gs_report-bstdk_e TO w_bstdk_e.
+
+* remove leading zero
+    CALL FUNCTION 'CONVERSION_EXIT_ALPHA_OUTPUT'
+      EXPORTING
+        input  = gs_report-kunnr
+      IMPORTING
+        output = w_kunnr.
+
+    IF p_rpt = 'PO'.
+      WRITE: /001(05) w_kunnr,
+              007(30) gs_report-name1,
+              040(30) gs_report-bolnr,
+              070(10) w_lfdat,                    "delivery date
+              082(10) w_tddat,                    "ship date
+              094(10) w_bstdk_e,                  "Fedex delivered date
+              106(10) gs_report-vbeln,
+              118(10) gs_report-vgbel,
+              130(30) gs_report-adr.
+    ELSE.
+      WRITE: /001(05) w_kunnr,
+              007(35) gs_report-name1,
+              043(30) gs_report-bolnr,
+              070(10) w_lfdat,                    "ship date
+              083(10) w_tddat,                    "delivery date
+              095(10) w_wadat,                    "PGI DATE
+              107(10) w_podat,                    "POD DATE
+              119(10) gs_report-vbeln,
+              130(30) gs_report-adr.
+    ENDIF.
+  ENDLOOP.
+
+* we need at least on email address
+  CHECK s_email[] IS NOT INITIAL.
+
+  CALL FUNCTION 'WWW_LIST_TO_HTML'
+    TABLES
+      html = lt_html.
+
+* Convert to xstring
+  LOOP AT lt_html INTO ls_html.
+*    ASSIGN ls_html TO <x> CASTING TYPE x.
+*    CONCATENATE lv_bin_file <x> INTO lv_bin_file IN BYTE MODE.
+    CONCATENATE lv_att_line ls_html-line INTO lv_att_line.
+  ENDLOOP.
+
+
+* Create subject line
+  ls_msg-contenttype  = 'txt'.
+  WRITE sy-datum TO lv_date_curr MM/DD/YYYY.
+  WRITE sy-uzeit TO lv_time_curr USING EDIT MASK '__:__:__'.
+
+  CONCATENATE p_subj lv_date_curr lv_time_curr
+         INTO ls_msg-subject SEPARATED BY space.
+
+  CONCATENATE 'B2B Exceptions:' w_heading INTO ls_msg-message SEPARATED BY space.
+
+* Create attachment
+  CONCATENATE 'B2B' w_heading lv_date_curr lv_time_curr
+         INTO ls_att-filename SEPARATED BY '_'.
+
+  CALL METHOD cl_bcs_convert=>string_to_xstring
+    EXPORTING
+      iv_string   = lv_att_line
+      iv_codepage = '4110'
+    RECEIVING
+      ev_xstring  = lv_bin_file.
+
+  ls_att-filetype = 'htm'.
+  ls_att-filedata = lv_bin_file.
+
+  APPEND ls_att TO lt_att.
+
+* Add email addresses
+  LOOP AT s_email.
+    ls_rec-c_address = s_email-low.
+    APPEND ls_rec TO lt_rec.
+  ENDLOOP.
+
+  CALL FUNCTION 'Z_SEND_EMAIL'
+    EXPORTING
+      requested_status = 'E'
+      send_immediately = 'X'
+      message          = ls_msg
+      attachments      = lt_att
+      recipients       = lt_rec
+      commit_work      = 'X'
+    IMPORTING
+      error_msg        = ls_error_msg.
+
+  IF ls_error_msg IS NOT INITIAL.
+    MESSAGE e000 WITH 'Error when sending out emails'.
+  ENDIF.
+
+ENDFORM.                    " WRITE_REPORT
+*&---------------------------------------------------------------------*
+*&      Form  WRITE_REPORT_DTL
+* Detail line report
+*&---------------------------------------------------------------------*
+FORM write_report_dtl.
+
+  FIELD-SYMBOLS: <x> TYPE x.
+
+  DATA:
+    lt_html TYPE w3htmltab,
+    lt_att  TYPE zet_email_attachments,
+    lt_rec  TYPE zet_email_recipients.
+
+  DATA:
+    ls_error_msg TYPE wzre_message,
+    ls_msg       TYPE zes_email_message,
+    ls_html      TYPE w3html,
+    ls_att       TYPE zes_email_attachments_line,
+    ls_rec       TYPE zes_email_recipients_line.
+
+  DATA:
+    lv_date_curr   TYPE char10,
+    lv_time_curr   TYPE char8,
+    lv_col         TYPE i,
+    lv_bin_file    TYPE xstring,
+    w_bstdk_e      TYPE sy-datum,
+    w_matnr        TYPE mara-matnr,
+    w_vbeln        TYPE lips-vbeln,
+    w_lfimg        TYPE p DECIMALS 0,
+    w_case_qty     TYPE p DECIMALS 0,
+    w_lfimg_ttl    TYPE p DECIMALS 0,
+    w_case_qty_ttl TYPE p DECIMALS 0,
+    w_name1        TYPE kna1-name1.
+
+
+  SORT gt_list_dtl BY kunnr bstdk_e.
+
+  LOOP AT gt_list_dtl INTO gs_report_dtl.
+    MOVE: gs_report_dtl-name1 TO w_name1.
+
+    AT NEW kunnr.
+      CLEAR: w_name, w_kunnr, w_vbeln, w_lfimg, w_case_qty, w_case_qty_ttl, w_lfimg_ttl.
+
+* remove leading zero
+      CALL FUNCTION 'CONVERSION_EXIT_ALPHA_OUTPUT'
+        EXPORTING
+          input  = gs_report_dtl-kunnr
+        IMPORTING
+          output = w_kunnr.
+
+      CONCATENATE w_kunnr w_name1 INTO w_name SEPARATED BY space.
+
+      NEW-PAGE.
+    ENDAT.
+
+    AT NEW vbeln.
+      CLEAR: w_case_qty_ttl, w_lfimg_ttl.
+
+* remove leading zero
+      CALL FUNCTION 'CONVERSION_EXIT_ALPHA_OUTPUT'
+        EXPORTING
+          input  = gs_report_dtl-vbeln
+        IMPORTING
+          output = w_vbeln.
+
+      MOVE: gs_report_dtl-bstdk_e  TO w_bstdk_e.
+
+      WRITE: /001(10)  w_vbeln,
+              012(10)  w_bstdk_e,
+              025(35)  gs_report_dtl-bolnr.
+    ENDAT.
+
+* remove leading zero
+    CALL FUNCTION 'CONVERSION_EXIT_ALPHA_OUTPUT'
+      EXPORTING
+        input  = gs_report_dtl-matnr
+      IMPORTING
+        output = w_matnr.
+
+    MOVE: gs_report_dtl-lfimg    TO w_lfimg,
+          gs_report_dtl-case_qty TO w_case_qty.
+
+    w_lfimg_ttl    = w_lfimg_ttl + w_lfimg.
+    w_case_qty_ttl = w_case_qty_ttl + w_case_qty.
+
+    WRITE: /004(5)  w_matnr,
+            012(8)  gs_report_dtl-kdmat,
+            025(40) gs_report_dtl-maktx,
+            082(5)  w_lfimg,
+            096(5)  w_case_qty.
+
+    AT END OF vbeln.
+      WRITE: /071     'Total:',
+              082(5)  w_lfimg_ttl,
+              096(5)  w_case_qty_ttl.
+    ENDAT.
+
+  ENDLOOP.
+
+* we need at least on email address
+  CHECK s_email[] IS NOT INITIAL.
+
+  CALL FUNCTION 'WWW_LIST_TO_HTML'
+    TABLES
+      html = lt_html.
+
+* Convert to xstring
+  LOOP AT lt_html INTO ls_html.
+    ASSIGN ls_html TO <x> CASTING TYPE x.
+    CONCATENATE lv_bin_file <x> INTO lv_bin_file IN BYTE MODE.
+  ENDLOOP.
+
+* Create subject line
+  ls_msg-contenttype  = 'txt'.
+  WRITE sy-datum TO lv_date_curr MM/DD/YYYY.
+  WRITE sy-uzeit TO lv_time_curr USING EDIT MASK '__:__:__'.
+
+  CONCATENATE p_subj lv_date_curr lv_time_curr
+         INTO ls_msg-subject SEPARATED BY space.
+
+  IF p_rpt = 'STR'.
+* walgreens store wants verbiage on the email
+    ls_msg-message = 'Gold Medal Bakery is a rack jobber. Please receive and create POs for delivered invoices listed in attachment. Store must create a separate PO per Invoice#. For any receiving process related inquiries, please contact your DM.'.
+  ELSE.
+    CONCATENATE 'B2B Exceptions:' w_heading INTO ls_msg-message SEPARATED BY space.
+  ENDIF.
+
+* Create attachment
+  CONCATENATE 'B2B' w_heading lv_date_curr lv_time_curr
+         INTO ls_att-filename SEPARATED BY '_'.
+
+  ls_att-filetype = 'htm'.
+  ls_att-filedata     = lv_bin_file.
+
+  APPEND ls_att TO lt_att.
+
+* Add email addresses
+  LOOP AT s_email.
+    ls_rec-c_address = s_email-low.
+    APPEND ls_rec TO lt_rec.
+  ENDLOOP.
+
+  CALL FUNCTION 'Z_SEND_EMAIL'
+    EXPORTING
+      requested_status = 'E'
+      send_immediately = 'X'
+      message          = ls_msg
+      attachments      = lt_att
+      recipients       = lt_rec
+      commit_work      = 'X'
+    IMPORTING
+      error_msg        = ls_error_msg.
+
+  IF ls_error_msg IS NOT INITIAL.
+    MESSAGE e000 WITH 'Error when sending out emails'.
+  ENDIF.
+
+ENDFORM.                    " WRITE_REPORT_DTL
